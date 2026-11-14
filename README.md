@@ -1,170 +1,143 @@
 # OCR Baseline
 
-Ảnh bao bì / tờ thuốc → **OCR** → **LLM tách thành các cột** → **SQLite** → người dùng xem và chỉnh sửa.
+Hệ thống trích xuất thông tin từ ảnh bao bì sản phẩm / tờ hướng dẫn sử dụng thuốc:
+**OCR** (lấy văn bản từ ảnh) → **LLM** (tách văn bản thành các trường dữ liệu) → **người dùng kiểm tra, chỉnh sửa**
+→ **lưu SQLite**.
 
-Hai cách thực hiện, chọn trên giao diện:
+## Mô hình và API sử dụng
 
-| Cách thực hiện | OCR | Kết quả đánh giá (100 ảnh ViFoodLabel) |
+| Thành phần | Công nghệ | Ghi chú |
 |---|---|---|
-| **Google Cloud Vision + LLM** (mặc định) | Google Cloud Vision API, cần mạng | OCR 95.7%, F1 tổng thể **83.7%**, ~3 s/ảnh |
-| **OCR local + LLM** | PaddleOCR + VietOCR chạy CPU, không gửi ảnh ra ngoài | OCR 82.6%, F1 tổng thể 69.9%, ~11 s/ảnh |
+| OCR qua API | **Google Cloud Vision API** (`DOCUMENT_TEXT_DETECTION`) | Cách thực hiện mặc định, cần mạng |
+| OCR cục bộ: phát hiện vùng chữ | **PaddleOCR** `PP-OCRv5_server_det` | Chạy trên CPU, không cần GPU |
+| OCR cục bộ: nhận dạng chữ | **VietOCR** `vgg_transformer` | Hỗ trợ đầy đủ tiếng Việt có dấu |
+| OCR cục bộ: tự xoay ảnh | PaddleOCR `PP-LCNet_x1_0_doc_ori` | Nhận biết ảnh xoay 0/90/180/270° |
+| Tách thông tin | **DeepSeek** (`deepseek-chat`, API tương thích OpenAI) | Chế độ JSON, temperature 0 |
+| Giao diện | Streamlit | |
+| Lưu trữ | SQLite | |
 
-Chi tiết đánh giá: `../OCR/docs/metrics/2026-11-14-llm-ocr-local-vs-vision.md`.
-LLM trong cả 2 cách là DeepSeek (`deepseek-chat`). Nếu không gọi được Google Vision (mất mạng, sai key,
-hết quota), app hiện thông báo kèm nút **"Chuyển sang OCR local"**.
+## Kiến trúc
 
-## Hai chế độ
+```
+                ┌───────────────────────────────────────────────┐
+   Ảnh ───────► │ OCR (chọn cách thực hiện)                     │ ──► Văn bản
+                │  • Google Cloud Vision API                    │
+                │  • OCR cục bộ: tiền xử lý → PaddleOCR         │
+                │    (phát hiện) → thứ tự đọc → VietOCR         │
+                └───────────────────────────────────────────────┘
+                                       │
+                                       ▼
+                ┌───────────────────────────────────────────────┐
+                │ LLM (DeepSeek) + prompt theo loại tài liệu    │ ──► Các trường (JSON)
+                │ + kiểm tra con số không có trong văn bản OCR  │
+                └───────────────────────────────────────────────┘
+                                       │
+                                       ▼
+                    Người dùng kiểm tra / chỉnh sửa ──► SQLite
+```
 
-| | Chế độ 1 - Tải ảnh lên | Chế độ 2 - Thư mục ảnh (dataset) |
-|---|---|---|
-| Đầu vào | Một hoặc nhiều ảnh của **cùng một sản phẩm** (nhiều mặt) | Thư mục, **mỗi ảnh là một sản phẩm** |
-| Xử lý | Từng bước: OCR → sửa text → LLM → sửa cột → lưu | Tự chạy hết thư mục, lưu từng ảnh ngay khi xong |
-| Prompt | Chọn trước khi gửi LLM | Chọn cho dataset (lần sau mặc định chọn lại prompt của dataset) |
-| Mã bản ghi | `UP-000001` | `DS-000002` |
-| Cột `mode` | `UPLOAD` | `DATASET` |
-| Cột `dataset` | `NULL` | tên dataset (bắt buộc) |
-| Trạng thái khi lưu | Đã duyệt | Chưa duyệt → chỉnh ở trang "Xem & chỉnh sửa dữ liệu" |
+- Mọi engine OCR có cùng giao diện `run(ảnh) -> văn bản`, nên đổi cách OCR không ảnh hưởng tới bước LLM và lưu trữ.
+- Không gọi được Google Cloud Vision (mất mạng, sai key, hết quota)? Hệ thống hiện thông báo kèm nút
+  **chuyển sang OCR cục bộ**.
+- **Loại tài liệu (profile)** quy định danh sách trường cần lấy và prompt gốc. Hiện có:
+  - bao bì thực phẩm: tên, thành phần, phụ gia, cảnh báo, dinh dưỡng, xuất xứ, khối lượng, ngày sản xuất, hạn dùng;
+  - tờ hướng dẫn sử dụng thuốc: 16 trường, gồm số đăng ký, hoạt chất, chỉ định, liều dùng, chống chỉ định...
 
-Chế độ 2:
+## Luồng xử lý
 
-- **Chạy tiếp được.** Dừng giữa chừng (bấm nút khác, đóng trang) rồi bấm "Bắt đầu / chạy tiếp"; ảnh đã xử lý được bỏ qua.
-- **Lỗi của một ảnh** (ảnh hỏng, LLM trả lỗi) được ghi trạng thái "Lỗi" và app chạy tiếp ảnh khác.
-  Tick "Xử lý lại các ảnh bị lỗi" để chạy lại riêng những ảnh này.
-- **Mất kết nối Google Vision** thì app dừng ngay. Nút "Chuyển sang OCR local và chạy tiếp" chạy nốt các ảnh còn lại bằng OCR local.
-- **Tên dataset** gắn với một thư mục và một loại tài liệu. Muốn chạy lại cùng thư mục với cấu hình khác thì đặt tên dataset khác.
-- **Mỗi dataset gắn một prompt** (`datasets.prompt_id`). Nếu chạy tiếp với prompt khác, app cảnh báo và yêu cầu
-  xác nhận. Bản ghi cũ giữ prompt cũ; ảnh xử lý tiếp dùng prompt mới. Muốn so sánh 2 prompt thì chạy cùng
-  thư mục với 2 tên dataset khác nhau.
+### Chế độ 1: Tải ảnh lên
 
-Trang **Xem & chỉnh sửa dữ liệu**:
+Dùng cho một sản phẩm. Có thể tải nhiều ảnh, tương ứng các mặt hoặc các trang của cùng sản phẩm.
 
-- lọc theo chế độ, dataset, trạng thái, loại tài liệu;
-- chọn một dòng để xem ảnh, sửa các cột hoặc sửa text OCR, rồi bấm **Lưu** (bản ghi chuyển sang Đã duyệt);
-- **Chạy lại LLM** (dùng text OCR đã sửa) hoặc **Chạy lại OCR + LLM** (dùng cách thực hiện đang chọn), đều được chọn prompt.
-  Mặc định là prompt của dataset; bản ghi được cập nhật sang prompt vừa dùng;
-- lọc theo prompt; tab "Prompt đã dùng" hiện đúng nội dung prompt đã tạo ra bản ghi;
-- xoá bản ghi, xuất CSV các bản ghi đang lọc.
+1. Chọn ảnh → **OCR**, xem văn bản từng ảnh và các dòng có độ tin cậy thấp.
+2. Sửa văn bản nếu cần → chọn prompt → **gửi LLM** để tách trường.
+3. Kiểm tra, sửa các trường (kèm cảnh báo con số đáng ngờ) → **lưu**. Mã bản ghi có dạng `UP-xxxxxx`.
 
-## Quản lý prompt
+### Chế độ 2: Chạy thư mục ảnh (dataset)
 
-Trang **Quản lý prompt** (theo loại tài liệu đang chọn ở thanh bên):
+Dùng cho nhiều sản phẩm. Mỗi ảnh trong thư mục là một sản phẩm.
 
-- **Prompt có phiên bản, không bị sửa đè.** Mỗi lần "Lưu" tạo một phiên bản mới: giữ tên thì version + 1,
-  đổi tên thì thành prompt mới. Bản ghi lưu `prompt_id` nên luôn biết **chính xác nội dung prompt** đã tạo ra nó.
-- **Prompt gốc** lấy từ code (`profiles/*.py`); prompt thực phẩm gốc là prompt v2 đã đánh giá. Prompt gốc không
-  sửa được trên giao diện: muốn thay đổi thì lưu với tên khác. Nếu sửa prompt gốc trong code, khi khởi động app
-  tự thêm phiên bản mới.
-- **Thử prompt**: chạy trên text OCR của một bản ghi có sẵn (so sánh với kết quả đã lưu) hoặc text tự dán.
-  Kết quả thử không được lưu.
-- **Kiểm tra cột**: app cảnh báo nếu prompt không nhắc tới cột nào của loại tài liệu.
-- **Ẩn** prompt khỏi danh sách chọn. **Xoá** chỉ được với prompt chưa có bản ghi hay dataset nào dùng.
+1. Nhập đường dẫn thư mục, đặt tên dataset, chọn prompt cho dataset.
+2. Hệ thống tự chạy OCR + LLM cho từng ảnh và lưu ngay khi xong. Mã bản ghi có dạng `DS-xxxxxx`, kèm tên dataset.
+3. Dừng giữa chừng vẫn **chạy tiếp được**: ảnh đã xử lý sẽ được bỏ qua.
+   - Ảnh lỗi được đánh dấu riêng để xử lý lại.
+   - Mất kết nối Google Vision: có thể chuyển sang OCR cục bộ và chạy nốt.
+4. Kiểm tra, chỉnh sửa kết quả ở trang **Xem & chỉnh sửa dữ liệu**.
+
+### Xem & chỉnh sửa dữ liệu
+
+- Lọc theo chế độ, dataset, trạng thái, loại tài liệu, prompt.
+- Xem ảnh, sửa các trường hoặc văn bản OCR rồi lưu. Bản ghi chuyển sang trạng thái *Đã duyệt*.
+- Chạy lại LLM (có thể chọn prompt khác) hoặc chạy lại cả OCR + LLM. Xoá bản ghi, xuất CSV.
+
+### Quản lý prompt
+
+- Prompt quản lý theo **phiên bản**: mỗi lần sửa tạo phiên bản mới, không sửa đè.
+- Mỗi dataset gắn một prompt. Mỗi bản ghi lưu rõ prompt và model LLM đã tạo ra nó.
+- Prompt gốc lấy từ code, không sửa được trên giao diện. Muốn thay đổi thì tạo prompt mới từ prompt gốc.
+- Có thể thử prompt trên một bản ghi có sẵn trước khi dùng.
+
+## Dữ liệu (SQLite)
+
+| Bảng | Nội dung chính |
+|---|---|
+| `records` | Mỗi dòng là một sản phẩm gồm:<br>• mã bản ghi (`UP-`/`DS-`), chế độ (`UPLOAD`/`DATASET`), tên dataset (chỉ chế độ 2);<br>• loại tài liệu, cách OCR, prompt và model LLM đã dùng;<br>• văn bản OCR, các trường (JSON), cảnh báo, trạng thái (*chưa duyệt* / *đã duyệt* / *lỗi*). |
+| `datasets` | Tên dataset, thư mục, loại tài liệu, prompt đang gắn |
+| `prompts` | Tên, phiên bản, loại tài liệu, nội dung, ghi chú, prompt gốc / đã ẩn |
+
+## Cấu trúc thư mục
+
+```
+app.py                       Điểm vào Streamlit (chỉ chọn trang)
+ui/                          Giao diện
+  sidebar.py                 Chọn chế độ, cách thực hiện, loại tài liệu
+  page_upload.py             Chế độ 1
+  page_dataset.py            Chế độ 2
+  page_records.py            Xem & chỉnh sửa dữ liệu
+  page_prompts.py            Quản lý prompt
+  components.py, resources.py, state.py
+src/ocr_baseline/            Logic xử lý (độc lập với giao diện)
+  config.py                  Đọc cấu hình từ .env
+  constants.py               Mã chế độ, cách thực hiện, trạng thái
+  pipeline.py                Các bước dùng chung: OCR ảnh, ghép văn bản, trích xuất
+  prompts.py                 Prompt có phiên bản
+  ocr/
+    vision.py                Google Cloud Vision
+    local/                   OCR cục bộ: tiền xử lý, PaddleOCR, VietOCR, thứ tự đọc
+  profiles/                  Loại tài liệu: danh sách trường + prompt gốc (food.py, drug.py)
+  extraction/                Gọi LLM, kiểm tra con số
+  services/                  Chạy thư mục ảnh (batch), đọc / lưu ảnh
+  storage/                   SQLite: định nghĩa bảng, đọc / ghi
+tests/                       Kiểm thử tự động (không gọi API)
+```
 
 ## Cài đặt và chạy
 
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-.venv/bin/pip install --no-deps vietocr==0.3.13      # deps gốc của vietocr ghim bản cũ
+.venv/bin/pip install --no-deps vietocr==0.3.13
 .venv/bin/pip install -e ".[dev]"
-cp .env.example .env                                 # điền DEEPSEEK_API_KEY, GOOGLE_VISION_API_KEY
+cp .env.example .env          # điền DEEPSEEK_API_KEY, GOOGLE_VISION_API_KEY
 
 .venv/bin/streamlit run app.py
-.venv/bin/python -m pytest                           # test (không gọi API, không cần model)
+.venv/bin/python -m pytest
 ```
 
-Trên máy dev hiện tại có thể dùng luôn môi trường của project OCR (đã cài sẵn Paddle, torch, VietOCR):
+- Lần đầu dùng OCR cục bộ, hệ thống tự tải model (PaddleOCR vào `~/.paddlex/`, VietOCR vào `MODELS_DIR`).
+- Các tuỳ chọn khác như số luồng CPU, độ phân giải phát hiện chữ, cách thực hiện và loại tài liệu mặc định
+  được mô tả trong `.env.example`.
 
-```bash
-../OCR/.venv/bin/pip install -e . --no-deps     # đã chạy
-../OCR/.venv/bin/streamlit run app.py
-```
-
-Lần đầu dùng OCR local, PaddleOCR sẽ tải model về `~/.paddlex/`. VietOCR dùng thư mục `MODELS_DIR`
-(file `.env` hiện trỏ tới `../OCR/models`).
-
-## Cấu trúc
-
-```
-app.py                       Điểm vào Streamlit: chỉ chọn trang
-ui/                          Giao diện (không chứa logic xử lý)
-  sidebar.py                 Chọn chế độ, cách thực hiện, loại tài liệu; trạng thái cấu hình
-  page_upload.py             Chế độ 1
-  page_dataset.py            Chế độ 2
-  page_records.py            Xem & chỉnh sửa dữ liệu
-  page_prompts.py            Quản lý prompt
-  components.py              Ô chọn prompt, form sửa các cột, cảnh báo con số, thông báo chuyển sang OCR local
-  resources.py               Engine OCR, Repository (tạo một lần, dùng lại)
-  state.py                   Key session_state dùng chung, callback của nút
-src/ocr_baseline/            Logic xử lý (dùng được cả ngoài giao diện, vd viết API sau này)
-  config.py                  Đọc .env -> get_settings()
-  constants.py               Mã chế độ (UPLOAD/DATASET), cách thực hiện, trạng thái
-  pipeline.py                Bước dùng chung: ocr_image, join_pages, extract(text, profile, prompt)
-  prompts.py                 Prompt (có phiên bản), prompt gốc từ profile
-  ocr/
-    __init__.py              create_engine(method, settings)
-    vision.py                Google Cloud Vision
-    local/                   OCR local: engine.py, preprocess.py, vietocr_rec.py, layout.py, geometry.py
-    errors.py                OcrUnavailableError (dừng, gợi ý đổi cách) / OcrImageError (lỗi riêng ảnh)
-    types.py                 OcrLine, OcrResult
-  profiles/                  Loại tài liệu = danh sách cột + prompt gốc
-    food.py                  Bao bì thực phẩm (prompt gốc = prompt v2 đã đánh giá)
-    drug.py                  Tờ hướng dẫn sử dụng thuốc (16 cột)
-  extraction/
-    llm.py                   Gọi LLM, chuẩn hoá output theo profile
-    checks.py                Phát hiện con số LLM đưa ra mà không có trong text OCR
-  services/
-    batch.py                 Chế độ 2: lập kế hoạch, chạy từng ảnh, chạy tiếp, ghi lỗi
-    images.py                Đọc ảnh, liệt kê thư mục, lưu bản sao ảnh tải lên
-  storage/
-    database.py              Định nghĩa bảng SQLite + tự nâng cấp DB cũ (thêm cột)
-    repository.py            Đọc / ghi (mọi câu SQL nằm ở đây)
-tests/                       Test (engine và LLM giả, không gọi API)
-data/                        baseline.db + uploads/ (không commit)
-```
-
-## Cơ sở dữ liệu (`data/baseline.db`)
-
-Bảng `records`: mỗi dòng là một sản phẩm.
-
-| Cột | Ý nghĩa |
-|---|---|
-| `code` | Mã bản ghi: `UP-xxxxxx` (chế độ 1) / `DS-xxxxxx` (chế độ 2). Số = id, tăng dần chung |
-| `mode` | `UPLOAD` / `DATASET` |
-| `dataset` | Tên dataset (chỉ chế độ 2; DB ràng buộc: DATASET bắt buộc có, UPLOAD phải NULL) |
-| `source_key` | Chế độ 2: tên file ảnh trong thư mục. Mỗi ảnh chỉ có một bản ghi trong một dataset |
-| `image_paths` | JSON: đường dẫn ảnh (chế độ 1: bản sao trong `data/uploads/`) |
-| `profile` | Loại tài liệu: `food` / `drug` |
-| `ocr_method` | Cách OCR đã dùng: `vision` / `local` |
-| `prompt_id` | Prompt đã tạo ra các cột (→ bảng `prompts`). NULL nếu chưa chạy được LLM (lỗi OCR) |
-| `llm_model` | Model LLM đã dùng |
-| `title` | Tên sản phẩm / tên thuốc |
-| `ocr_text` | Text OCR (đã sửa nếu người dùng sửa) |
-| `fields_json` | JSON: các cột thông tin theo profile |
-| `warnings_json` | JSON: con số LLM đưa ra mà không có trong text OCR |
-| `status` | `auto` (chưa duyệt) / `reviewed` (đã duyệt) / `error` |
-| `error_message`, `ocr_seconds`, `llm_seconds`, `created_at`, `updated_at` | |
-
-Bảng `datasets`: `name`, `folder`, `profile`, `prompt_id` (prompt gắn với dataset), `created_at`.
-
-Bảng `prompts`: `id`, `name`, `version` (UNIQUE(name, version)), `profile`, `content`, `note`,
-`is_builtin` (prompt gốc từ code), `archived` (ẩn), `created_at`. Không bao giờ sửa đè nội dung.
-
-## Sửa / mở rộng thường gặp
+## Mở rộng
 
 | Muốn | Sửa ở |
 |---|---|
-| Sửa quy ước tách cột (prompt) | Trang **Quản lý prompt** (tạo phiên bản mới), không cần sửa code |
-| Thêm / bớt cột | `profiles/food.py` hoặc `profiles/drug.py` (DB không cần migrate vì cột lưu dạng JSON). Nhớ sửa prompt cho khớp |
-| Thêm loại tài liệu mới | Thêm file trong `profiles/`, đăng ký trong `profiles/__init__.py` |
-| Thêm cách OCR mới | Class có `run(img) -> OcrResult` trong `ocr/`, thêm mã vào `constants.py`, thêm nhánh trong `ocr/__init__.py` |
-| Đổi model LLM, số luồng, độ phân giải detection | `.env` |
-| Thêm API (FastAPI...) | Gọi `create_engine`, `pipeline.ocr_image`, `pipeline.extract`, `Repository` giống `ui/` |
+| Sửa quy ước tách trường | Trang **Quản lý prompt** (không cần sửa code) |
+| Thêm / bớt trường | `src/ocr_baseline/profiles/` |
+| Thêm loại tài liệu | Thêm file trong `profiles/`, đăng ký trong `profiles/__init__.py` |
+| Thêm cách OCR | Class có `run(ảnh) -> OcrResult` trong `ocr/`, thêm mã vào `constants.py` và `ocr/__init__.py` |
 
 ## Lưu ý
 
-- Prompt thực phẩm gốc giống hệt "prompt v2" đã đánh giá (F1 83.7%). Prompt mới tạo trên giao diện chưa được đo;
-  nên đo lại bằng `../OCR/evaluation/` trước khi dùng cho dữ liệu thật.
-- Profile `drug` chưa có dataset có nhãn để đo độ chính xác.
-- Google Cloud Vision gửi ảnh lên máy chủ Google. Giá: 1000 ảnh/tháng miễn phí, sau đó khoảng 1.5 USD/1000 ảnh.
-- OCR local: đặt `OCR_THREADS` bằng số nhân thật của máy. Nếu Paddle chạy rất chậm (CPU có nhân E),
-  đặt `OCR_ENABLE_MKLDNN=false`.
+- Google Cloud Vision gửi ảnh lên máy chủ Google và cần mạng. OCR cục bộ chạy hoàn toàn trên máy.
+- Thông tin do hệ thống trích xuất cần được người dùng kiểm tra trước khi sử dụng.
