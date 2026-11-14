@@ -1,0 +1,5 @@
+# Cài theo thứ tự (xem README):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+#   pip install --no-deps vietocr==0.3.13
+#   pip install -r requirements.txt
+-e .[dev]

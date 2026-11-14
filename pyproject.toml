@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ocr-baseline"
+version = "1.0.0"
+description = "OCR baseline: Google Cloud Vision / OCR local (PaddleOCR + VietOCR) + LLM tách cột + SQLite"
+requires-python = ">=3.10"
+dependencies = [
+    # OCR local (ghim phiên bản: paddlepaddle 3.3.x lỗi oneDNN trên CPU)
+    "paddlepaddle==3.2.2",
+    "paddleocr==3.7.0",
+    "paddlex==3.7.2",
+    "einops",
+    # torch (bản CPU) và vietocr cài riêng, xem README
+    "numpy",
+    "opencv-contrib-python",
+    "pandas",
+    "pillow",
+    "requests",
+    "streamlit>=1.40",
+    "openai>=1.30",
+    "python-dotenv",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]
